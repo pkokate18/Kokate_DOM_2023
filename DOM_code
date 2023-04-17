@@ -1,0 +1,977 @@
+library(readr)
+library(tidyverse)
+library(ggplot2)
+library(ggh4x)
+library(vegan)
+library(dada2)
+library(DESeq2)
+library(dplyr)
+library(FSA)
+library(PMCMRplus)
+library(ggstatsplot)
+library(phyloseq)
+library(readxl)
+library(vegan)
+library(pairwiseAdonis)
+library(devtools)
+
+rm(list = ls())
+getwd()
+setwd("/data/home/pkokate/DOM/fastq_files")
+
+
+
+path<-'/data/home/pkokate/DOM/fastq_files'
+list.files(path)
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))#sorts and lists all files in the path with _R1.fastq
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+sn1 <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sn1
+sample.names <- sn1
+fnFs
+sample.names
+#plotQualityProfile(fnFs[11:19])
+#plotQualityProfile(fnRs[11:19])
+#filt_path <- file.path(path, "filtered")
+filtFs <- file.path(path,"gunzipped", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path,"gunzipped", paste0(sample.names, "_R_filt.fastq.gz"))
+exists <- file.exists(filtFs) & file.exists(filtRs)
+
+
+###RUNTILLHEREFORTHESTUPIDexists
+filtFs <- filtFs[exists]
+filtRs <- filtRs[exists]
+fnFs<-fnFs[exists]
+fnRs<-fnRs[exists]
+
+F341 <- "CCTAYGGGGYGCWGCAG"
+R806 <- "GACTACNVGGGTMTCTAATCC"
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(275,210), trimLeft=c(nchar(F341), nchar(R806)),
+                     maxN=0, maxEE=Inf, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+
+
+read.stats <- out %>%
+  as_tibble() %>%
+  summarise(
+    max.in = max(reads.in),
+    min.in = min(reads.in),
+    mean.in = mean(reads.in),
+    median.in = median(reads.in),
+    sum.in = sum(reads.in),
+    count.in = sum(ifelse(reads.in > 0, 1, 0)),
+    under1000.in = sum(ifelse(reads.in < 1000, 1, 0)),
+    max.out = max(reads.out),
+    min.out = min(reads.out),
+    mean.out = mean(reads.out),
+    median.out = median(reads.out),
+    sum.out = sum(reads.out),
+    count.out = sum(ifelse(reads.out > 0, 1, 0)),
+    percent.out = 100*mean.out/mean.in,
+    under1000.out = sum(ifelse(reads.out < 1000, 1, 0))
+  )
+View(t(read.stats))
+
+
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=FALSE)
+names(derepFs) <- sample.names[exists]
+names(derepRs) <- sample.names[exists]
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+dadaRs[[11]]# do it for dadaFs (1 through 11)
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE, justConcatenate = FALSE, minOverlap = 12)
+head(mergers[[1]])
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+table(nchar(getSequences(seqtab)))
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names[exists]
+#track
+write.csv(track,"Trunclen275210_trimleftF341R806_maxeeinf_JCF_M12.csv", row.names = TRUE)
+
+
+taxa <- assignTaxonomy(seqtab.nochim, "~/data/NEHA/silva_nr_v128_train_set.fa.gz", multithread=TRUE,tryRC=TRUE)
+taxa <- addSpecies(taxa, "~/data/NEHA/silva_species_assignment_v128.fa.gz")
+
+saveRDS(taxa, "/data/home/pkokate/DOM/fastq_files/taxa_trimleftF341R806.rds")
+saveRDS(seqtab.nochim, "/data/home/pkokate/DOM/fastq_files/seqtab.nochim_trimleftF341R806.rds")
+
+
+
+#youcannowstartfromhere
+
+sequence_table <- readRDS("/data/home/pkokate/DOM/fastq_files/seqtab.nochim_trimleftF341R806.rds")
+colnames(sequence_table) <- NULL # because it still has seqneuces as col names
+head(sequence_table)
+tail(sequence_table)
+sequence_table
+
+sequence_table <- as.matrix(sequence_table)                                #change to matrix format
+m <- (colSums(sequence_table, na.rm=TRUE) != 0)                        #T if colSum is not 0, F otherwise
+nonzero <- sequence_table[, m]   # essentially select all the rows and only the columns where the colsum is not zero
+# each ASV is a column...that column exists because there is atleast 1 with that particular sequence..why would the sum of each column ever be zero
+
+
+taxa_table <- readRDS("/data/home/pkokate/DOM/fastq_files/taxa_trimleftF341R806.rds")
+taxa_table <- as.matrix(taxa_table)                                #change to matrix format
+taxa_table[1:5,1:5]   
+
+samples.out <- rownames(sequence_table)
+sample_information<-read.csv("Miseq_metadata_final.csv")
+samplenamesofseqtabnochim<-sample.names 
+samplenamesofseqtabnochim<-as.list(samplenamesofseqtabnochim)
+sample_information_1<-as.data.frame(sample_information)
+sample_information_1
+sample_info_2 <- sample_information_1 %>% 
+  mutate(sample_names = Sample_ID) ###renamedSample_ID as sample_names
+sample_info_3 = select(sample_info_2, -1) #removed the first column which were just serial numbers
+sample_info_3<-as.data.frame(sample_info_3)
+rownames(sample_info_3)<-NULL # removed the rownames,which were again serial numbers
+rownames(sample_info_3) <- sample_info_3[,6] # made column 6 as the rownames..thesearethesamplenames
+samdata = sample_data(sample_info_3) # created samdata..a component of phyloseq object !?!  
+
+seqtab_1 = otu_table(nonzero, taxa_are_rows = FALSE)                 #define sequence table
+taxtab = tax_table(taxa_table)                                     #define taxa table
+rownames(taxtab) <- NULL     
+
+sample_names(samdata) # check sample names of samdata
+sample_names(seqtab_1) # check sample names of seqtab_1
+phyloseq_object_all = phyloseq(otu_table(seqtab_1), tax_table(taxtab), sample_data(samdata))
+
+#####got the phyloseq object so far
+
+#####
+
+MISEQ_remove_mito_chloro <- phyloseq_object_all %>%
+  subset_taxa(
+    Family  != "D_4__mitochondria" &             #filter out mitochondria
+      Class   != "D_2__Chloroplast"                #filter out chloroplasts
+  )
+DOM_exclusive <- subset_samples(MISEQ_remove_mito_chloro, Expt=="DOM")
+
+DOM_Phylumabundance <- DOM_exclusive %>%
+  tax_glom(taxrank = "Phylum") %>%                     # agglomerate at Phylum level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance
+  psmelt()%>%                                          # Melt to long format
+  dplyr::arrange(Phylum) 
+
+
+DOM_Phylum <- DOM_Phylumabundance %>%
+  select(Phylum, Sample, days, DOM, Which_blank, Abundance) %>%
+  group_by(Phylum, Sample, Which_blank, DOM, days) %>%
+  summarise(avg_abundance = mean(Abundance)
+  ) %>%
+  mutate(
+    Phylum = as.character(Phylum),
+    Phylum = ifelse(avg_abundance < 0.02, "< 2 %", Phylum)
+  ) %>%
+  group_by(Phylum, Sample, Which_blank, DOM, days) %>%
+  summarise(
+    sum_abundance = sum(avg_abundance)
+  )
+head(DOM_Phylum)
+DOM_stupidblanks <- DOM_Phylum %>% filter(!DOM=="XYZ")
+DOM_morestupidblanks <- DOM_stupidblanks %>% filter (Which_blank =="Rep")
+
+Color_22_Palette <- c("darkgray", "blue", "aquamarine", "chocolate1", "deepskyblue", "gray88", "green","gold","darkred","orangered","magenta","orange","black","cyan","seagreen3","royalblue","red","purple","white","sienna4","darkolivegreen","darkseagreen","mediumvioletred")
+Color_10_Palette <- c("aquamarine", "deepskyblue", "green","darkred","magenta","orange","black","cyan","seagreen3","royalblue","red","sienna4","darkolivegreen","darkseagreen","mediumvioletred")
+
+
+#Make the plot
+
+ggplot(DOM_morestupidblanks, aes(x=Sample, y=sum_abundance, fill= Phylum))+
+  geom_bar(stat="identity",position="stack",color="black")+
+  scale_fill_manual(values = Color_22_Palette)+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))+
+  theme(legend.position = "bottom")+
+  theme(legend.text=element_text(size=15))+
+  theme(axis.text.x = element_blank())+
+  ggtitle("Community composition: phylum level")+
+  facet_wrap(vars(DOM, days), strip.position = "top", scales = "free_x", nrow = 1) 
+
+
+###justday42
+DOMphylumforday42 <- subset(DOM_morestupidblanks, days==42)
+
+ggplot(DOMphylumforday42, aes(x=Sample, y=sum_abundance, fill= Phylum))+
+  geom_bar(stat="identity",position="stack",color="black")+
+  scale_fill_manual(values = Color_22_Palette)+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))+
+  theme(legend.position = "bottom")+
+  theme(legend.text=element_text(size=15))+
+    facet_wrap(vars(DOM), strip.position = "top", scales = "free_x", nrow = 1) +
+  ggtitle("Community composition:Phylum level after forty-two days of enrichment") +
+  theme(legend.title = element_text(colour="black", size=16, face="bold"))+
+  theme(axis.text.y   = element_text(size=10,face="bold",color="black"),
+        axis.text.x = element_blank(),
+        axis.title.y  = element_text(size=14),
+        axis.title.x  = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text = element_text(size = 10, face="bold",color="black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))+guides(size=FALSE)
+
+####doingit for class
+DOM_Classabundance <- DOM_exclusive %>%
+  tax_glom(taxrank = "Class") %>%                     # agglomerate at Class level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance
+  psmelt()%>%                                          # Melt to long format
+  dplyr::arrange(Class) 
+head(DOM_Classabundance)
+
+
+DOM_Class <- DOM_Classabundance %>%
+  select(Class, Sample, days, DOM, Which_blank, Abundance) %>%
+  group_by(Class, Sample, Which_blank, DOM, days) %>%
+  summarize(avg_abundance = mean(Abundance)
+  ) %>%
+  mutate(
+    Class = as.character(Class),
+    Class = ifelse(avg_abundance < 0.02, "< 2 %", Class)
+  ) %>%
+  group_by(Class, Sample, Which_blank, DOM, days) %>%
+  summarize(
+    sum_abundance = sum(avg_abundance)
+  )
+head(DOM_Class)
+DOM_stupidblanks_classy <- DOM_Class %>% filter(!DOM=="XYZ")
+DOM_morestupidblanks_classy <- DOM_stupidblanks_classy %>% filter (Which_blank =="Rep")
+
+
+
+Color_20_Palette <- c("magenta4", "red1", "palevioletred", "darkolivegreen", "chartreuse1", "deeppink1","cornsilk4","darkorange1","blue3","cornflowerblue","coral4","springgreen2","plum1","salmon2","yellow")
+ggplot(DOM_morestupidblanks_classy, aes(x=Sample, y=sum_abundance, fill= Class))+
+  geom_bar(stat="identity",position="stack",color="black")+
+  scale_fill_manual(values = Color_20_Palette)+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))+
+  theme(legend.position = "bottom")+
+  theme(legend.text=element_text(size=15))+
+  facet_wrap(vars(DOM, days), strip.position = "top", scales = "free_x", nrow = 1) +
+  ggtitle("Community composition: Class level") +
+  theme(legend.title = element_text(colour="black", size=16, face="bold"))+
+  theme(axis.text.y   = element_text(size=10,face="bold",color="black"),
+        axis.text.x = element_blank(),
+        axis.title.y  = element_text(size=14),
+        axis.title.x  = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text = element_text(size = 10, face="bold",color="black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))+guides(size=FALSE)
+
+DOMclassyforday42 <- subset(DOM_morestupidblanks_classy, days==42)
+Color_13_Palette <- c("#FFFF33", "#990033", "#00FF00", "#FF0000", "#CC00CC", "#FF0066","#00CCFF","#0000CC","#000033","#3399FF", "#FFCCFF", "#006600", "#666666")
+ggplot(DOMclassyforday42, aes(x=Sample, y=sum_abundance, fill= Class))+
+  geom_bar(stat="identity",position="stack",color="black")+
+  scale_fill_manual(values = Color_20_Palette)+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))+
+  theme(legend.position = "bottom")+
+  theme(legend.text=element_text(size=15))+
+  facet_wrap(vars(DOM), strip.position = "top", scales = "free_x", nrow = 1) +
+  ggtitle("Community composition: Class level after forty-two days of enrichment") +
+  theme(legend.title = element_text(colour="black", size=16, face="bold"))+
+  theme(axis.text.y   = element_text(size=10,face="bold",color="black"),
+        axis.text.x = element_blank(),
+        axis.title.y  = element_text(size=14),
+        axis.title.x  = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text = element_text(size = 10, face="bold",color="black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))+guides(size=FALSE)
+
+####doingit for Genus
+DOM_Genusabundance <- DOM_exclusive %>%
+  tax_glom(taxrank = "Genus") %>%                     # agglomerate at Genus level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance
+  psmelt()%>%                                          # Melt to long format
+  dplyr::arrange(Genus) 
+head(DOM_Genusabundance)
+
+
+DOM_Genus <- DOM_Genusabundance %>%
+  select(Genus, Sample, days, DOM, Which_blank, Abundance) %>%
+  group_by(Genus, Sample, Which_blank, DOM, days) %>%
+  summarize(avg_abundance = mean(Abundance)
+  ) %>%
+  mutate(
+    Genus = as.character(Genus),
+    Genus = ifelse(avg_abundance < 0.02, "< 2 %", Genus)
+  ) %>%
+  group_by(Genus, Sample, Which_blank, DOM, days) %>%
+  summarize(
+    sum_abundance = sum(avg_abundance)
+  )
+head(DOM_Genus)
+
+DOM_stupidblanks_Genusy <- DOM_Genus %>% filter(!DOM=="XYZ")
+DOM_morestupidblanks_Genusy <- DOM_stupidblanks_Genusy %>% filter (Which_blank =="Rep")
+
+
+ggplot(DOM_morestupidblanks_Genusy, aes(x=Sample, y=sum_abundance, fill= Genus))+
+  geom_bar(stat="identity",position="stack",color="black")+
+  scale_fill_manual(values = phylum_colors)+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))+
+  theme(legend.position = "bottom")+
+  theme(legend.text=element_text(size=15))+
+  facet_wrap(vars(DOM, days), strip.position = "top", scales = "free_x", nrow = 1) +
+  ggtitle("Community composition:Genus level") +
+  theme(legend.title = element_text(colour="black", size=16, face="bold"))+
+  theme(axis.text.y   = element_text(size=10,face="bold",color="black"),
+        axis.text.x = element_blank(),
+        axis.title.y  = element_text(size=14),
+        axis.title.x  = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text = element_text(size = 10, face="bold",color="black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))+guides(size=FALSE)
+
+
+DOMGenusyforday42 <- subset(DOM_morestupidblanks_Genusy, days==42)
+ggplot(DOMGenusyforday42, aes(x=Sample, y=sum_abundance, fill= Genus))+
+  geom_bar(stat="identity",position="stack",color="black")+
+  scale_fill_manual(values = phylum_colors)+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))+
+  theme(legend.position = "bottom")+
+  theme(legend.text=element_text(size=15))+
+  facet_wrap(vars(DOM), strip.position = "top", scales = "free_x", nrow = 1) +
+  ggtitle("Community composition: Genus level after forty-two days of enrichment") +
+  theme(legend.title = element_text(colour="black", size=16, face="bold"))+
+  theme(axis.text.y   = element_text(size=10,face="bold",color="black"),
+        axis.text.x = element_blank(),
+        axis.title.y  = element_text(size=14),
+        axis.title.x  = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text = element_text(size = 10, face="bold",color="black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))+guides(size=FALSE)
+
+#rarefy
+sample_sums(DOM_exclusive)# gives number of reads per sample
+taxa_sums(DOM_exclusive)
+samplesover5000_all <- subset_samples(DOM_exclusive, sample_sums(DOM_exclusive) > 5000) #only keeping samples that have more than 5000 reads
+any(taxa_sums(samplesover5000_all) == 0) # checking if after keeping just >5000 do we have a situation where we deleted the row..and now the column sum is zero
+sum(taxa_sums(samplesover5000_all) == 0) #286 columns now have a sum of zero
+prune_samplesover5000_all <- prune_taxa(taxa_sums(samplesover5000_all) > 0, samplesover5000_all)
+any(taxa_sums(prune_samplesover5000_all) == 0)
+set.seed(81)
+rarefy_samplesover5000_all <- rarefy_even_depth(prune_samplesover5000_all, rngseed= 81, sample.size = min(sample_sums(prune_samplesover5000_all)))
+pps<- rarefy_samplesover5000_all
+
+min(sample_sums(prune_samplesover5000_all)) # this is 5797...we removed all that were less than 5000
+min(sample_sums(DOM_exclusive)) 
+sample_colors <- c("aquamarine", "chocolate1", "deepskyblue" )
+pps_wo_II <-subset_samples(pps, DOM !="Initial_Inoculum")
+pps_wo_II %>%  
+   plot_richness(
+    x = "DOM",                                                    #compare diversity of datatype
+    measures = c("Shannon")) +                                         #choose diversity measures
+    geom_boxplot(width=0.2) +      
+    geom_jitter(aes(colour = DOM, size=3),width = 0.10, height = 0.10)+   #add boxplot, set width
+    theme_classic()+                                                      #change theme to classic
+    scale_color_manual(values = c("green", "brown", "blue" ))+                            #set fill colors
+   ylab("Shannon") +                           #add title
+  theme(plot.title=element_text(size = 14, face = "bold", hjust = 0.5))+     #change title size, face and position
+  theme(legend.position ="none") + # get rid of the legend
+  theme(axis.text.y   = element_text(size=14,face="bold",color="black"),
+        axis.text.x = element_text(size=14,face="bold",color="black"),
+        axis.title.y  = element_text(size=14,face="bold",color="black"),
+        axis.title.x  = element_text(size=14,face="bold",color="black"),
+        axis.line = element_line(colour = "black"),
+        strip.text = element_text(size = 10, face="bold",color="black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+###doing richness shannon for 42 days
+pps_wo_II_42 <- subset_samples(pps_wo_II, days=="42")
+pps_wo_II_42 %>%                                                              #phyloseq object
+  plot_richness(
+    x = "DOM",                                                    #compare diversity of datatype
+    measures = c("Shannon")) +                                         #choose diversity measures
+  geom_boxplot(width=0.2) +      
+  geom_jitter(aes(colour = DOM, size=3),width = 0.10, height = 0.10)+ #add boxplot, set width
+  theme_classic()+                                                      #change theme to classic
+  scale_fill_manual(values = sample_colors)+                            #set fill colors
+  ggtitle("Richness (after 42 days)") +  ylab("Richness") +                           #add title
+  theme(plot.title=element_text(size = 14, face = "bold", hjust = 0.5))+     #change title size, face and position
+  theme(legend.position ="none") + # get rid of the legend
+  theme(axis.text.y   = element_text(size=14,face="bold",color="black"),
+        axis.text.x = element_text(size=14,face="bold",color="black"),
+        axis.title.y  = element_text(size=14,face="bold",color="black"),
+        axis.title.x  = element_text(size=14,face="bold",color="black"),
+        axis.line = element_line(colour = "black"),
+        strip.text = element_text(size = 10, face="bold",color="black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+###some alpha diversity stats -Kruskal-Wall
+sample_info_4 <- sample_info_3 %>% dplyr::rename(Sample = sample_names)
+richness <- pps_wo_II %>%
+  estimate_richness(measures = c("Shannon")) %>%           #specify which measures
+  rownames_to_column(var = "Sample") %>%
+  left_join(sample_info_4, by = "Sample")
+head(richness)
+kruskal.test(Shannon ~ DOM, data = richness) 
+kruskal.test(Shannon ~ days, data = richness) 
+
+PT = dunnTest(Shannon ~ DOM,
+              data=richness,
+              method="bh")
+PT
+
+####now doing KRuskal Wallis to see how the diversity has changed from the original (Initial inoculum)
+sample_info_4 <- sample_info_3 %>% dplyr::rename(Sample = sample_names)
+richness_with_II <- pps %>%
+  estimate_richness(measures = c("Shannon")) %>%           #specify which measures
+  rownames_to_column(var = "Sample") %>%
+  left_join(sample_info_4, by = "Sample")
+head(richness_with_II)
+
+
+
+pps %>%  
+  plot_richness(
+    x = "DOM",                                                    #compare diversity of datatype
+    measures = c("Shannon")) +                                         #choose diversity measures
+  geom_boxplot(width=0.2) +      
+  geom_jitter(aes(colour = DOM, size=3),width = 0.10, height = 0.10)+   #add boxplot, set width
+  theme_classic()+                                                      #change theme to classic
+  scale_color_manual(values = c("green", "brown", "pink","blue" ))+                            #set fill colors
+  ylab("Shannon") +                           #add title
+  theme(plot.title=element_text(size = 14, face = "bold", hjust = 0.5))+     #change title size, face and position
+  theme(legend.position ="none") + # get rid of the legend
+  theme(axis.text.y   = element_text(size=14,face="bold",color="black"),
+        axis.text.x = element_text(size=14,face="bold",color="black"),
+        axis.title.y  = element_text(size=14,face="bold",color="black"),
+        axis.title.x  = element_text(size=14,face="bold",color="black"),
+        axis.line = element_line(colour = "black"),
+        strip.text = element_text(size = 10, face="bold",color="black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+kruskal.test(Shannon ~ DOM, data = richness_with_II) 
+kruskal.test(Shannon ~ days, data = richness_with_II) 
+
+PT = dunnTest(Shannon ~ DOM,
+              data=richness_with_II,
+              method="bh")
+PT
+
+
+
+
+
+
+###using measure Observed ASVsTHIS IS TOTAL CRAP..NEITHER STATS ARE SIGNIFICANT NOR ARE THE PLOTS PRETTY
+###the code is the same except Shannon is replaced with Observed..I am deleting the code we are not using 
+###THE OBSERVED ASV CRAP ENDS HERE
+
+
+#statsplusplots
+ggbetweenstats(
+  data = richness,
+  x = DOM,
+  y = Shannon,
+  type = "nonparametric", # ANOVA or Kruskal-Wallis
+  plot.type = "box",
+  pairwise.comparisons = TRUE,
+  pairwise.display = "significant",
+  centrality.plotting = FALSE,
+  bf.message = FALSE,
+  title = "Differences in alpha-diversity (Shannon index) among DOM enrichments"
+) + 
+  ggplot2::scale_color_manual(values = c("green", "brown", "blue"))+
+  theme(axis.text.y   = element_text(size=12,face="bold"),
+        axis.text.x   = element_text(size=12,face="bold"),
+        axis.title.y  = element_text(size=12,face="bold"),
+        axis.title.x  = element_text(size=12,face="bold"),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.border = element_rect(colour = "black", fill=NA, size=1.5)
+  )
+
+
+
+#statistics for alpha diversity at day 42
+richness_day42 <- pps_wo_II_42 %>%
+  estimate_richness(measures = c("Shannon")) %>%           #specify which measures
+  rownames_to_column(var = "Sample") %>%
+  left_join(sample_info_4, by = "Sample")
+head(richness_day42)
+kruskal.test(Shannon ~ DOM, data = richness_day42) 
+
+##alpha diversity using observed ASVs 
+
+
+#evennessIPROBABLYDONTNEEDTHIS...SHANNON TAKES CARE OF EVENNESS ALSO
+Pielou(richness, window=3, rasterOut=TRUE, np=1, na.tolerance=1.0, cluster.type="SOCK",
+       debugging=FALSE)
+sample_data(pps)
+sample_sums(pps)
+taxa_sums(pps)
+
+count_samples1 <- sample_data(pps) %>%
+  group_by(DOM) %>%
+  summarise(
+    count = n()
+  )
+View(count_samples1)
+
+
+
+###betadiversity
+ord <- ordinate(
+  physeq = pps_wo_II, 
+  method = "PCoA", 
+  distance = "bray"
+)
+
+
+three_colors<-sample_colors <- c("green", "brown", "blue" )
+pps_wo_II@sam_data$days <-as.factor(pps_wo_II@sam_data$days)
+plot_ordination(
+  physeq = pps_wo_II,                                                  #phyloseq object
+  ordination = ord)+                                                #ordination
+  geom_point(aes(color = DOM, shape=days), size = 5) +         #sets fill color to sampletype
+  scale_color_manual(values = three_colors) + 
+  scale_shape_manual(values = c(19, 17, 15)) + #specify colors
+  theme_classic()   
+
+
+####trying the unimpose blanks
+blanking_out <- plot_ordination(physeq = pps, ordination = ord,type="samples")
+blanking_out$data <- blanking_out$data %>%
+  filter(Which_blank != "Rep")
+         
+  blanking_out+                                                #ordination
+  geom_point(aes(color = DOM, shape=Which_blank), size = 5) +         #sets fill color to sampletype
+  scale_color_manual(values = three_colors) + 
+  scale_shape_manual(values = c(8, 19, 17, 15)) + #specify colors
+  theme_classic()   
+  
+###tryingtoidentifywhetherfilterblanksarefromthesameday
+  blanking_out+                                                #ordination
+    geom_point(aes(color = as.factor(days), shape=Which_blank), size = 5) +         #sets fill color to sampletype
+    scale_color_manual(values = three_colors) + 
+    scale_shape_manual(values = c(8, 19, 17, 15)) + #specify colors
+    theme_classic()     
+###trying to get 3 diff PCOa plots
+pps_chlor_ES <-subset_samples(pps_wo_II, DOM !="SRFA")
+ord_chlor_ES <- ordinate(
+  physeq = pps_chlor_ES, 
+  method = "PCoA", 
+  distance = "bray"
+)
+
+pps_wo_II@sam_data$days <-as.factor(pps_wo_II@sam_data$days)
+plot_ordination(
+  physeq = pps_chlor_ES,                                                  #phyloseq object
+  ordination = ord_chlor_ES)+                                                #ordination
+  geom_point(aes(color = DOM, shape=days), size = 5) +         #sets fill color to sampletype
+  scale_color_manual(values = three_colors) + 
+  scale_shape_manual(values = c(19, 17, 15)) + #specify colors
+  theme_classic()   
+
+
+###trying to get 3 diff PCOa plots
+pps_chlor_ES <-subset_samples(pps, DOM !="SRFA")
+ord_chlor_ES <- ordinate(
+  physeq = pps_chlor_ES, 
+  method = "PCoA", 
+  distance = "bray"
+)
+
+
+###PLACING THE BLANKS IN THE pcoa PLOTS
+
+
+
+
+
+
+
+
+
+
+
+
+bray <- phyloseq::distance(pps_wo_II, method = "bray")
+sam <- data.frame(sample_data(pps_wo_II))
+adonis2(bray ~ DOM + days + DOM*days, data = sam)
+
+library(devtools)
+library(pairwiseAdonis)
+adonis2(bray ~ DOM/days, data = sam)
+pairwise.adonis2(bray ~ DOM/days, data = sam)
+pairwise.adonis2(bray ~ DOM, data = sam)
+
+#a big color pallete
+phylum_colors <- c(
+  "#CBD588", "#5F7FC7", "orange","#DA5724", "#508578", "#CD9BCD",
+  "#AD6F3B", "#673770","#D14285", "#652926", "#C84248", "blue",
+  "#8569D5", "#5E738F","#D1A33D", "#8A7C64", "#599861", "#CBD588", "#5F7FC7", "orange","#DA5724", "#508578", "#CD9BCD",
+  "#AD6F3B", "#673770","#D14285", "#652926", "#C84248", 
+  "#8569D5", "#5E738F","#D1A33D", "#8A7C64", "#599861", "#CBD588", "#5F7FC7", "orange","#DA5724", "#508578", "#CD9BCD",
+  "#AD6F3B", "#673770","#D14285", "#652926", "#C84248", "blue",
+  "#8569D5", "#5E738F","#D1A33D", "#8A7C64", "#599861", "#CBD588", "#5F7FC7", "orange","#DA5724", "#508578", "#CD9BCD",
+  "#AD6F3B", "#673770","#D14285", "#652926", "#C84248", 
+  "#8569D5", "#5E738F","#D1A33D", "#8A7C64", "#599861",
+  "#CBD588", "#5F7FC7", "orange","#DA5724", "#508578", "#CD9BCD",
+  "#AD6F3B", "#673770","#D14285", "#652926", "#C84248", "blue",
+  "#8569D5", "#5E738F","#D1A33D", "#8A7C64", "#599861", "#CBD588", "#5F7FC7", "orange","#DA5724", "#508578", "#CD9BCD",
+  "#AD6F3B", "#673770","#D14285", "#652926", "#C84248", 
+  "#8569D5", "#5E738F","#D1A33D", "#8A7C64", "#599861","#CBD588", "#5F7FC7", "orange","#DA5724", "#508578", "#CD9BCD",
+  "#AD6F3B", "#673770","#D14285", "#652926", "#C84248", "blue",
+  "#8569D5", "#5E738F","#D1A33D", "#8A7C64", "#599861", "#CBD588", "#5F7FC7", "orange","#DA5724", "#508578", "#CD9BCD",
+  "#AD6F3B", "#673770","#D14285", "#652926", "#C84248", 
+  "#8569D5", "#5E738F","#D1A33D", "#8A7C64", "#599861"
+)
+
+###PCOA plot with blanks
+sample_atleastone <- subset_samples(DOM_exclusive, sample_sums(DOM_exclusive) > 1 ) #only keeping samples that have more than 5000 reads
+any(taxa_sums(sample_atleastone) == 0) # checking if after keeping just > 1 do we have a situation where we deleted the row..and now the column sum is zero
+sum(taxa_sums(sample_atleastone) == 0) 
+prune_sample_atleastone <- prune_taxa(taxa_sums(sample_atleastone) > 0, sample_atleastone)
+any(taxa_sums(prune_sample_atleastone) == 0)
+set.seed(81)
+rarefy_sample_atleastone <- rarefy_even_depth(prune_sample_atleastone, rngseed= 81, sample.size = min(sample_sums(prune_sample_atleastone)))
+###betadiversity
+ord <- ordinate(
+  physeq = rarefy_sample_atleastone, 
+  method = "PCoA", 
+  distance = "bray"
+)
+rarefy_sample_atleastone@sam_data$days <-as.factor(rarefy_sample_atleastone@sam_data$days)
+plot_ordination(
+  physeq = rarefy_sample_atleastone,                                                  #phyloseq object
+  ordination = ord)+                                                #ordination
+  geom_point(aes(color = DOM, shape=Which_blank), size = 4) +         #sets fill color to sampletype
+  scale_fill_manual(values = Color_22_Palette) +            #specify colors
+  scale_shape_manual(values = c(15, 16,17,18,11,8)) +  #specify shapes
+  theme_classic()   
+
+rarefy_sample_atleastone@sam_data$days <-as.factor(rarefy_sample_atleastone@sam_data$days)
+plot_ordination(
+  physeq = rarefy_sample_atleastone,                                                  #phyloseq object
+  ordination = ord)+                                                #ordination
+  geom_point(aes(color = days, shape=Which_blank), size = 4) +         #sets fill color to sampletype
+  scale_fill_manual(values = Color_22_Palette) +            #specify colors
+  scale_shape_manual(values = c(15, 16,17,18,11,8)) +  #specify shapes
+  theme_classic() 
+########extracting the asv table
+ASV_DOM=as(otu_table(DOM_exclusive),"matrix")
+ASV_DOM_df<-as.data.frame(ASV_DOM)
+write.csv(ASV_DOM_df,"ASV_DOM.csv")
+write_phyloseq(DOM_exclusive, type = "TAXONOMY", path = getwd())
+
+#####################################################################################
+###DESEQ for differential abundance
+library(matrixStats)
+library(DESeq2)
+library(phyloseq)
+library(ggh4x)
+
+
+###significantlyenrichedtaxa
+DOM_justbacteria <-phyloseq_object_all %>%
+  subset_taxa(
+    Kingdom == "Bacteria" &                   #only bacteria
+      Family  != "Mitochondria" &             #filter out mitochondria
+      Class   != "Chloroplast"                #filter out chloroplasts
+  ) %>%
+  subset_samples(Expt == "DOM") %>%
+  subset_samples(days == "42")
+DOM_justbacteria
+saveRDS(DOM_justbacteria, file = "/data/home/pkokate/DOM/fastq_files/DOM_30508_justbacteria.rds")
+head(sample_data(DOM_justbacteria))
+DOM_justbacteria@otu_table <- as.matrix(DOM_justbacteria@otu_table)+1
+sample_info5 <- as.data.frame(sample_data(DOM_justbacteria))
+what<-unique(sample_info5$DOM) ###just one entry per DOM...three total entries
+
+
+Chlorella_ES <- DOM_justbacteria %>% subset_samples(DOM == "Chlorella" | DOM == "ES")
+Chlorella_ES_2 <- prune_taxa(taxa_sums(Chlorella_ES) > 0, Chlorella_ES)
+Chlorella_SRFA <- DOM_justbacteria %>% subset_samples(DOM == "Chlorella" | DOM == "SRFA")
+Chlorella_SRFA_2 <- prune_taxa(taxa_sums(Chlorella_SRFA) > 0, Chlorella_SRFA)
+ES_SRFA <- DOM_justbacteria %>% subset_samples(DOM == "ES" | DOM == "SRFA")
+ES_SRFA_2 <- prune_taxa(taxa_sums(ES_SRFA) > 0, ES_SRFA)
+
+#chekc whether the DOMs were sorted correctly
+unique(as.data.frame(sample_data(Chlorella_ES))$DOM)
+unique(as.data.frame(sample_data(Chlorella_SRFA))$DOM)
+unique(as.data.frame(sample_data(ES_SRFA))$DOM)
+
+
+## make sure there are no zero counts
+any(taxa_sums(Chlorella_ES_2)==0)
+any(taxa_sums(Chlorella_SRFA_2)==0)
+any(taxa_sums(ES_SRFA_2)==0)
+
+#phyloseq to DESEQ object
+ps.Chlorella_ES <- phyloseq_to_deseq2(Chlorella_ES_2, ~ DOM)
+ps.Chlorella_SRFA <- phyloseq_to_deseq2(Chlorella_SRFA_2, ~ DOM)
+ps.ES_SRFA <- phyloseq_to_deseq2(ES_SRFA_2, ~ DOM)
+
+
+#relevel...adjusting who will represent the baseline
+ps.Chlorella_ES$DOM <-relevel(ps.Chlorella_ES$DOM, "Chlorella")
+ps.Chlorella_SRFA$DOM <-relevel(ps.Chlorella_SRFA$DOM, "Chlorella")
+ps.ES_SRFA$DOM <- relevel(ps.ES_SRFA$DOM, "ES")
+
+# Run DESeq2 analysis (all taxa at once!)
+dds_ps.Chlorella_ES <- DESeq(ps.Chlorella_ES)
+dds_ps.Chlorella_SRFA <- DESeq(ps.Chlorella_SRFA)
+dds_ps.ES_SRFA <- DESeq(ps.ES_SRFA)
+
+
+# Investigate results
+resultsNames(dds_ps.Chlorella_ES )
+resultsNames(dds_ps.Chlorella_SRFA)
+resultsNames(dds_ps.ES_SRFA)
+
+# Put DESeq output into data frames
+taxing_Chlorella_ES <- as.data.frame(results(dds_ps.Chlorella_ES, contrast=c("DOM","ES","Chlorella"))) %>% mutate(Comparison="Chlorella versus Elliot Soil") %>% rownames_to_column(var = "taxon")
+taxing_Chlorella_SRFA <- as.data.frame(results(dds_ps.Chlorella_SRFA, contrast=c("DOM","SRFA","Chlorella"))) %>% mutate(Comparison="Chlorella versus SRFA") %>% rownames_to_column(var = "taxon")
+taxing_ES_SRFA <- as.data.frame(results(dds_ps.ES_SRFA, contrast=c("DOM","SRFA","ES"))) %>% mutate(Comparison="Elliot Soil versus SRFA") %>% rownames_to_column(var = "taxon")
+head(taxing_ES_SRFA)
+
+
+taxing_Chlorella_ES <- as.data.frame(results(dds_ps.Chlorella_ES)) %>% mutate(Comparison="Chlorella versus Elliot Soil") %>% rownames_to_column(var = "taxon")
+taxing_Chlorella_SRFA <- as.data.frame(results(dds_ps.Chlorella_SRFA)) %>% mutate(Comparison="Chlorella versus SRFA") %>% rownames_to_column(var = "taxon")
+taxing_ES_SRFA <- as.data.frame(results(dds_ps.ES_SRFA)) %>% mutate(Comparison="Elliot Soil versus SRFA") %>% rownames_to_column(var = "taxon")
+
+
+# Add taxonomy to DESeq output
+taxed_Chlorella_ES <- as.data.frame(tax_table(taxing_Chlorella_ES)) %>% rownames_to_column(var = "taxon") %>% full_join(taxing_Chlorella_ES)
+taxed_Chlorella_SRFA <- as.data.frame(tax_table(taxing_Chlorella_SRFA)) %>% rownames_to_column(var = "taxon") %>% full_join(taxing_Chlorella_SRFA)
+taxed_ES_SRFA <- as.data.frame(tax_table(taxing_ES_SRFA)) %>% rownames_to_column(var = "taxon") %>% full_join(taxing_ES_SRFA)
+head(taxed_ES_SRFA)
+
+#checking dimensions
+dim(taxing_Chlorella_ES)
+dim(taxed_Chlorella_ES)
+
+##joining everything together
+enriched <- taxed_Chlorella_ES %>% 
+  full_join(taxed_Chlorella_SRFA) %>%
+  full_join(taxed_ES_SRFA) %>%
+  filter(!is.na(padj)) %>%
+  mutate(
+    threshold = ifelse(padj <= 0.001 & abs(log2FoldChange) >= 2, "Enriched", "Not_Enriched"),
+    Enriched_Genus = ifelse(threshold == "Enriched", as.character(taxon), "Not Enriched"),
+    Enriched_Genus = ifelse(is.na(Enriched_Genus), "Unclassified Genus", Enriched_Genus)
+  ) 
+
+
+#OR
+
+enriched <- taxed_Chlorella_ES %>% 
+  full_join(taxed_Chlorella_SRFA) %>%
+  full_join(taxed_ES_SRFA) %>%
+  filter(!is.na(padj)) %>%
+  mutate(
+    threshold = ifelse(padj <= 0.001 & abs(log2FoldChange) >= 2, "Enriched", "Not_Enriched"))
+huh<- as.data.frame(tax_table(DOM_justbacteria))
+huh_1 <- huh %>% rownames_to_column(var = "taxon_1")
+sigtab = merge(enriched, huh_1, by.x="taxon", by.y="taxon_1")
+head(sigtab)
+
+getwd()
+write.csv(sigtab,"/data/home/pkokate/DOM/fastq_files/DOM__30508_diff_enriched.csv")
+
+
+DOM_diff_enriched_counts <- sigtab %>%
+  mutate(Category = ifelse(log2FoldChange > 2, "Right", "not_sig"),
+         Category = ifelse(log2FoldChange < -2, "Left", Category)) %>%
+  group_by(Comparison, Category) %>%
+  summarise(Count = n()) %>%
+  filter(Category != "not_sig")
+DOM_diff_enriched_counts
+
+#any(is.na(enriched_w_tax))
+#View(enriched_counts)
+
+# Re-Order data to organize legend
+
+sigtab_1 <- sigtab %>%
+  mutate(enrichedgenus =ifelse(threshold=="Enriched", Genus, "NA"))
+sort(unique(sigtab_1$enrichedgenus))
+length(unique(sigtab_1$enrichedgenus))
+
+sigtab_1$enrichedgenus <- factor(sigtab_1$enrichedgenus, levels = c("Acidovorax","Acinetobacter","Aeromonas",  "Afipia",    
+                                                                    "Aminobacter","Arthrobacter", "Bosea","Brevundimonas" ,         
+                                                                    "Caenimonas", "Candidatus_Symbiobacter", "Comamonas",  "Cupriavidus", 
+                                                                    "Curvibacter","Dechloromonas","Devosia",    "Dyadobacter", 
+                                                                    "Exiguobacterium","Ferruginibacter","Flavihumibacter","Flavobacterium",        
+                                                                    "Frigoribacterium","Herminiimonas","Hyphomicrobium","Kaistia",   
+                                                                    "Leucobacter","Massilia",   "Methylophilus","Methylorosula",          
+                                                                    "Mucilaginibacter","Mycobacterium","NA","Nitrosomonas",
+                                                                    "Nordella",   "Noviherbaspirillum","Novosphingobium","Ochrobactrum",
+                                                                    "Paenarthrobacter","Paenibacillus","Paeniglutamicibacter","Parvibaculum",
+                                                                    "Paucimonas", "Pedobacter", "Pelomonas","Perlucidibaca",          
+                                                                    "Polaromonas","Pseudarthrobacter","Pseudochrobactrum","Pseudolabrys",
+                                                                    "Pseudomonas","Pseudorhodoferax","Pseudoxanthomonas","Raoultella",
+                                                                    "Rhizobium","Rhizomicrobium","Rhodanobacter","Rhodoferax",
+                                                                    "Rhodopseudomonas","Sediminibacterium","Shinella",   "Solitalea", 
+                                                                    "Soonwooa","Sphingobacterium","Sphingobium","Sphingomonas",
+                                                                    "Sphingopyxis", "Variibacter","Verrucomicrobium","Zoogloea"))
+
+cl <- colors(distinct = TRUE)
+set.seed(15887) # to set random generator seed
+colors48 <- sample(cl, length(unique(sigtab_1$enrichedgenus)))
+shapes <- c(
+  21, 22, 23, 24,
+  21, 22, 23, 24,
+  21, 22, 23, 24,
+  21, 22, 23, 24,
+  21, 22, 23, 24,
+  21, 22, 23, 24, 
+  21, 22, 23, 24, 
+  21, 22, 23, 24,
+  21, 22, 23, 24,
+  21, 22, 23, 24,
+  22, 21,14,15,17,18,9,10)
+length(shapes)
+
+
+#volcano plot:
+ggplot(data=sigtab_1, aes(x=log2FoldChange, y=-log10(padj))) +
+  geom_point(aes(fill=enrichedgenus), shape = 21, size=3) +
+  facet_grid(cols = vars(Comparison))+
+  labs(x = "log2 fold change", 
+       y = "-log10 p-value") +
+  theme_classic(base_size = 14)+
+  geom_hline(yintercept = -log10(0.001), colour="#990000", linetype="dashed") + 
+  geom_vline(xintercept = 2, colour="#990000", linetype="dashed") + 
+  geom_vline(xintercept = -2, colour="#990000", linetype="dashed")+ 
+  theme(axis.text.y.left = element_text(size = 20),
+        axis.text.x = element_text(size = 20, angle = 0, vjust = 0.5, hjust = 0.5),
+        axis.title.y = element_text(size = 25),
+        axis.title.x = element_text(size = 25),
+        legend.text = element_text(size = 18),
+        legend.title = element_blank(),
+        strip.text.x = element_text(size = 16, face = "bold", angle = 0),
+        legend.position = "bottom",
+        title = element_text(size = 18))#+
+#guides(fill = guide_legend(override.aes = list(shape = shapes)))
+
+
+#diff way
+enriched_summary <- sigtab_1 %>%
+  filter(threshold == "Enriched") %>%
+  mutate(Genus2 = ifelse(is.na(Genus), "", Genus),
+         Species2 = ifelse(is.na(Species), "", Species)) %>%
+  unite(Taxonomy, Genus2, Species2, sep = " ") %>%
+  mutate(Taxonomy = ifelse(Taxonomy == " ", "Unclassified Organism", Taxonomy),
+         Where_Enriched = case_when(
+           (Comparison == "Chlorella versus Elliot Soil" & log2FoldChange > 2) ~ "Chlorella_vs_Elliot Soil",
+           (Comparison == "Chlorella versus SRFA" & log2FoldChange < -2) ~ "Chlorella_vs_SRFA",
+           (Comparison == "Elliot Soil versus SRFA" & log2FoldChange > 2) ~ "Elliot Soil_vs_SRFA")) %>%
+  select(Where_Enriched, Phylum, Class, Order, Family, Genus, Species, Taxonomy, log2FoldChange, padj)
+
+
+
+enriched_filt <- sigtab_1 %>%
+  filter(threshold == "Enriched") %>%
+  mutate(Genus2 = ifelse(is.na(Genus), "", Genus),
+         Species2 = ifelse(is.na(Species), "", Species)) %>%
+  unite(Taxonomy, Genus2, Species2, sep = " ") %>%
+  mutate(Taxonomy = ifelse(Taxonomy == " ", "Unclassified Organism", Taxonomy),
+         Where_Enriched = case_when(
+           (Comparison == "Chlorella versus Elliot Soil" & log2FoldChange > 2) ~ "Elliot Soil",
+           (Comparison == "Chlorella versus SRFA" & log2FoldChange > 2) ~ "SRFA",
+           (Comparison == "Chlorella versus SRFA" & log2FoldChange < -2) ~ "Chlorella",
+           (Comparison == "Elliot Soil versus SRFA" & log2FoldChange < -2) ~ "Elliot Soil",
+           (Comparison == "Chlorella versus Elliot Soil" & log2FoldChange < -2) ~ "Chlorella",
+           (Comparison == "Elliot Soil versus SRFA" & log2FoldChange > 2) ~ "SRFA"))
+
+
+#library(ggh4x)
+ggplot(data=enriched_filt, aes(y=Taxonomy, x=log2FoldChange)) +
+  facet_nested(cols = vars(Where_Enriched), rows = vars(Class),space = "free_y",  scales = "free_y")+
+  geom_col(aes(fill = Where_Enriched, y=Taxonomy, x=log2FoldChange), color = "black")+
+  scale_fill_manual(values = c("green", "brown", "blue"))+
+  xlab("log2 fold change")+ 
+  ylab("Significantly Enriched Taxa") +
+  theme_linedraw(base_size = 14)+
+  theme(axis.text.x = element_text(size = 15, angle = 0, vjust = 1, hjust = 0.5),
+        axis.text.y = element_text(size = 8, angle = 0, hjust = 1, vjust = 0.5),
+        axis.title.y = element_text(size = 15),
+        axis.title.x = element_text(size = 12),
+        legend.text = element_text(size = 18),
+        legend.title = element_blank(),
+        strip.text.x = element_text(size = 14, face = "bold", angle = 0),
+        strip.text.y = element_text(size = 14, face = "bold", angle = 0),
+        legend.position = "bottom",
+        title = element_text(size = 18))
+
+
+
+#########DOM DOC
+library(ggplot2)
+library(tidyverse)
+library(curl)
+library(readxl)
+#install.packages('gghighlight')
+library(gghighlight)
+setwd("/data/home/pkokate/DOM")
+DOM_DOC <-read_excel("DOM_DOC_data.xlsx")
+DOM_DOC_1 <- DOM_DOC %>% filter (Experiment == "Enrichment_experiment_2") %>% filter (Analysis == "DOC") %>% filter (Sample=="sample")
+DOM_DOC_2 <- DOM_DOC_1 %>% filter (Treatment == "SRFA") %>%
+  mutate(used= 10-as.numeric(Concentration)) 
+
+DOM_DOC_3 <- DOM_DOC_1 %>% filter (Treatment != "SRFA") %>%
+  mutate(used= 20-as.numeric(Concentration))
+DOM_DOC_4 <-rbind(DOM_DOC_2, DOM_DOC_3)
+#write.csv(DOM_DOC_2,"DOM_DOC_whatshappening.csv")
+DOM_DOC_4$day<-as.factor(DOM_DOC_4$day) # aes shape will not take a continous variable
+DOM_DOC_4$Concentration <-as.integer(DOM_DOC_4$Concentration) # I had crazy decimals that wouldnt go away  
+
+DOM_DOC_4$Replicate<-as.factor(DOM_DOC_4$Replicate)
+
+DOM_DOC_highlightES <- DOM_DOC_4 %>% filter (Treatment == "ES") %>% filter (Replicate =="1")
+DOM_DOC_highlightSRFA <- DOM_DOC_4 %>% filter (Treatment == "SRFA") %>% filter (Replicate =="6")
+DOM_DOC_highlightCHLOR <- DOM_DOC_4 %>% filter (Treatment == "Chlorella") %>% filter (Replicate =="2")
+DOM_DOC_highlight <-rbind(DOM_DOC_highlightES,DOM_DOC_highlightSRFA,DOM_DOC_highlightCHLOR)
+
+
+ggplot(DOM_DOC_4,aes(x=factor(Replicate, level=c('1', '2', '3', '4','5', '6', '7', '8','9', '10')), y= used, color= Treatment, shape=day)) +
+  geom_point(size=5) +  
+  scale_color_manual(values=c("green","brown", "blue")) +
+  geom_point(data=DOM_DOC_highlight,aes(x=Replicate,y= used), color='Yellow', size=3) +
+  ggtitle("DOC consumed") + xlab("Sample (Replicate No.)") + ylab("DOC consumed (mg C/L)") + 
+  theme(legend.title = element_text(colour="black", size=12))+
+  theme(axis.text.y   = element_text(colour="black", size=10, face="bold"),
+        axis.text.x   = element_text(colour="black", size=10, face="bold"),
+        axis.title.y  = element_text(colour="black", size=10, face="bold"),
+        axis.title.x  = element_text(colour="black", size=10, face="bold"),
+        axis.line = element_line(colour = "black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))+
+  facet_wrap(vars(Treatment), strip.position = "bottom", scales = "free_x", nrow = 1)
+
+
+ggplot(DOM_DOC_4,aes(x=factor(Replicate, level=c('1', '2', '3', '4','5', '6', '7', '8','9', '10')), y= used, color= Treatment, shape=day)) +
+  geom_point(size=5) +  
+  scale_color_manual(values=c("green","brown", "blue")) +
+  ggtitle("DOC consumed") + xlab("Sample (Replicate No.)") + ylab("DOC consumed (mg C/L)") + 
+  theme(legend.title = element_text(colour="black", size=12))+
+  theme(axis.text.y   = element_text(colour="black", size=10, face="bold"),
+        axis.text.x   = element_text(colour="black", size=10, face="bold"),
+        axis.title.y  = element_text(colour="black", size=10, face="bold"),
+        axis.title.x  = element_text(colour="black", size=10, face="bold"),
+        axis.line = element_line(colour = "black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1))+
+  facet_wrap(vars(Treatment), strip.position = "bottom", scales = "free_x", nrow = 1)
